@@ -1,0 +1,459 @@
+/*Importing the file  */
+proc import datafile="/home/u64280361/CHARGING_STATIONS/WORKING.FILE/ai_loan_approval_dataset.xlsx"
+DBMS=xlsx
+out=model_pre
+replace;
+sheet=model_predictions;
+run;
+
+proc import 
+    datafile="/home/u64280361/CHARGING_STATIONS/WORKING.FILE/ai_loan_approval_dataset.xlsx"
+    dbms=xlsx
+    out=customers
+    replace;
+    sheet="customer_demographics";
+run;
+
+/*Checking variables  */
+proc contents data=model_pre; 
+run;
+proc contents data=customers; 
+run;
+
+/*Checking missing variables from both table  */
+proc sql;
+select 
+    count(*) as total_rows,
+    sum(missing(customer_id)) as miss_customer,
+    sum(missing(predicted_label)) as miss_predicted,
+    sum(missing(actual_label)) as miss_actual,
+    sum(missing(confidence_score)) as miss_confidence
+from model_pre;
+quit;
+
+proc sql;
+select
+    count(*) as total_rows,
+    sum(missing(customer_id)) as miss_customer,
+    sum(missing(gender)) as miss_gender,
+    sum(missing(age)) as miss_age,
+    sum(missing(income_group)) as miss_income,
+    sum(missing(region)) as miss_region
+from customers;
+quit;
+
+/* Creating cleaned model_pre dataset */
+proc sql;
+create table model_clean as
+select *
+from model_pre
+where actual_label is not missing
+and predicted_label is not missing
+and customer_id is not missing
+and confidence_score between 0 and 1
+   and confidence_score is not missing;
+quit;
+
+proc sql;
+select distinct predicted_label
+from model_clean;
+quit;
+
+proc sql ;
+select count(*) as total_rows
+from model_clean ;
+quit;
+/* Checking duplicates */
+proc sql;
+select *
+from model_clean
+where customer_id in (
+    select customer_id
+    from customers_clean
+    group by customer_id
+    having count(*) > 1
+)
+order by customer_id;
+quit;
+ 
+proc sql;
+create table customers_dedup as
+select distinct *
+from model_clean;
+quit;
+
+/* Cleaning customers table  */
+proc sql;
+create table customers_clean as
+select 
+customer_id,
+/* Clean Gender */
+case 
+when upcase(gender) in ('M','MALE') then 'Male'
+when upcase(gender) in ('F','FEMALE') then 'Female'
+else 'Unknown'
+end as gender length=10,
+    /* Clean Age (extract numeric part) */
+input(scan(age,1,' '), 8.) as age,
+    /* Clean Region */
+propcase(region) as region length=15,
+    /* Clean Income Group */
+case 
+when upcase(income_group) in ('L','LOW') then 'Low'
+when upcase(income_group) in ('MID','MEDIUM') then 'Medium'
+when upcase(income_group) = 'HIGH' then 'High'
+else 'Unknown'
+end as income_group length=10
+from customers;
+quit;
+
+proc sql ;
+select count(*) as total_rows
+from customers_clean ;
+quit;
+/*Checking duplicates   */
+proc sql;
+select *
+from customers_clean
+where customer_id in (
+    select customer_id
+    from customers_clean
+    group by customer_id
+    having count(*) > 1
+)
+order by customer_id;
+quit;
+ 
+proc sql;
+create table customers_dedup as
+select distinct *
+from customers_clean;
+quit;
+
+
+/* Joining both tables using left join */
+proc sql;
+create table final_dataset as
+select a.*, b.gender, b.age, b.region, b.income_group
+from model_clean as a
+left join customers_clean as b
+on a.customer_id = b.customer_id;
+quit;
+
+/* Treating missing values after join */
+proc sql;
+/*average age and confidence */
+select avg(age), avg(confidence_score)
+into :avg_age, :avg_conf
+from final_dataset
+where age is not missing
+and confidence_score is not missing;
+/* Replace missing values */
+create table final_dataset_clean as
+select 
+prediction_id,
+model_id,
+model_version,
+customer_id,
+predicted_label,
+actual_label,
+/* Confidence */
+case 
+when confidence_score is missing then &avg_conf
+else confidence_score
+end as confidence_score,
+prediction_date,
+/* Gender */
+case 
+when gender is missing then 'Unknown'
+else gender
+end as gender,
+/* Age */
+case 
+when age is missing then &avg_age
+else age
+end as age,
+/* Region */
+case 
+when region is missing then 'Unknown'
+else region
+end as region,
+/* Income */
+case 
+when income_group is missing then 'Unknown'
+else income_group
+end as income_group
+from final_dataset;
+quit;
+
+/*Understanding Business
+A bank implemented an AI model to predict:
+Loan Approved / Rejected
+With a confidence score
+Now the bank wants to know:
+which ai model accurate is more accurate as we have three models?
+Is it biased towards certain groups?
+Where is the model making mistakes?
+Should we trust high confidence predictions?
+Which customer segments are high risk? */
+
+/*Is the ai model performing well?  */
+proc sql;
+select 
+model_version,
+count(*) as Total_Records,
+sum(case 
+when predicted_label = actual_label then 1 else 0 end) as Correct_Predictions,
+calculated Correct_Predictions / calculated Total_Records * 100 as Accuracy_Percentage format=6.2
+from final_dataset
+group by model_version;
+quit;
+/* Therefore the accuracy % of v1 model is 49.16%,v2 model is 48.69% and v3 model is 49.50%*/
+
+
+proc sql;
+select 
+model_version,
+/* True Positive */
+sum(case when predicted_label=1 and actual_label=1 then 1 else 0 end) as TP,
+/* False Positive */
+sum(case when predicted_label=1 and actual_label=0 then 1 else 0 end) as FP,
+/* False Negative */
+sum(case when predicted_label=0 and actual_label=1 then 1 else 0 end) as FN,
+/* Precision */
+calculated TP / (calculated TP + calculated FP) as Precision format=6.2,
+/* Recall */
+calculated TP / (calculated TP + calculated FN) as Recall format=6.2
+from final_dataset_clean
+group by model_version;
+quit;
+/*Business insight: All three models are performing around 50% precision and recall. 
+When model approves a loan, it is correct only -50% of the time,
+Out of all customers who deserve approval, model is approving only -50%  */
+/*  v3 is slightly better:
+Highest Recall (0.51)
+Lowest FN (552),fewer good customers rejected */
+
+
+/*If model is biased */
+proc sql;
+select 
+    gender,
+    model_version,
+    count(*) as Total_Customers,
+    sum(predicted_label) as Total_Approvals,
+    calculated Total_Approvals / calculated Total_Customers * 100 
+        as Approval_Rate format=6.2
+from final_dataset_clean
+group by gender, model_version
+order by gender, model_version;
+quit;
+proc sql;
+select 
+    model_version,
+    gender,
+    count(*) as Total_Customers,
+    sum(predicted_label) as Total_Approvals,
+    calculated Total_Approvals / calculated Total_Customers * 100 
+        as Approval_Rate format=6.2
+from final_dataset_clean
+group by model_version, gender
+order by model_version, gender;
+quit;
+proc sql;
+select 
+model_version,
+case 
+when age < 30 then 'Under 30'
+when age between 30 and 50 then '30-50'
+else 'Above 50'
+end as Age_Group,
+count(*) as Total_Customers,
+sum(predicted_label) as Total_Approvals,
+calculated Total_Approvals / calculated Total_Customers * 100 
+as Approval_Rate format=6.2
+from final_dataset_clean
+group by model_version, Age_Group
+order by model_version, Age_Group;
+quit;
+proc sql;
+select 
+    model_version,
+    region,
+    avg(predicted_label)*100 as Approval_Rate format=6.2
+from final_dataset_clean
+group by model_version, region
+order by model_version, calculated Approval_Rate desc;
+quit;
+
+proc sql;
+select 
+    gender,
+    avg(confidence_score) as Avg_Confidence format=6.2
+from final_dataset_clean
+group by gender;
+quit;
+
+proc sql;
+select 
+    gender,
+    sum(case when predicted_label=1 and actual_label=0 then 1 else 0 end)
+/ count(*) * 100 as False_Positive_Rate format=6.2
+from final_dataset_clean
+group by gender;
+quit;
+/*Business insight : The model does not exhibit significant demographic bias across gender, 
+age, or region, as approval and error rates vary only marginally between groups.
+ However, overall predictive performance remains weak (~50% precision and recall), indicating limited discriminatory power.
+ The primary issue is low model effectiveness rather than fairness imbalance. */
+/*Should we trust confidence score? */
+proc sql;
+select 
+gender,
+/* False Positive Rate */
+sum(case when predicted_label=1 and actual_label=0 then 1 else 0 end)
+/ sum(case when actual_label=0 then 1 else 0 end) * 100 
+as False_Positive_Rate format=6.2,
+/* False Negative Rate */
+sum(case when predicted_label=0 and actual_label=1 then 1 else 0 end)
+/ sum(case when actual_label=1 then 1 else 0 end) * 100 
+as False_Negative_Rate format=6.2
+from final_dataset_clean
+group by gender;
+quit;
+/* The model shows mild performance imbalance across genders, but not severe discrimination. */
+/* High risk = High False Positive RateMale customers (52.98%)
+This group is most likely to:
+Be wrongly approved
+Potentially default */
+/* We should NOT blindly trust high confidence predictions , as the Avg confidence ≈ 0.69 – 0.71
+But FPR ≈ 50% */
+proc sql;
+select 
+case 
+when age < 30 then 'Under 30'
+when age between 30 and 50 then '30-50'
+else 'Above 50'
+end as Age_Group,
+sum(case when predicted_label=1 and actual_label=0 then 1 else 0 end)
+/ sum(case when actual_label=0 then 1 else 0 end) * 100 
+as False_Positive_Rate format=6.2,
+sum(case when predicted_label=0 and actual_label=1 then 1 else 0 end)
+/ sum(case when actual_label=1 then 1 else 0 end) * 100 
+as False_Negative_Rate format=6.2
+from final_dataset_clean
+group by Age_Group;
+quit;
+
+proc sql;
+select 
+region,
+sum(case when predicted_label=1 and actual_label=0 then 1 else 0 end)
+/ sum(case when actual_label=0 then 1 else 0 end) * 100 
+as False_Positive_Rate format=6.2,
+sum(case when predicted_label=0 and actual_label=1 then 1 else 0 end)
+/ sum(case when actual_label=1 then 1 else 0 end) * 100 
+as False_Negative_Rate format=6.2
+from final_dataset_clean
+group by region;
+quit;
+
+proc sql;
+select 
+income_group,
+sum(case when predicted_label=1 and actual_label=0 then 1 else 0 end)
+/ sum(case when actual_label=0 then 1 else 0 end) * 100 
+as False_Positive_Rate format=6.2,
+sum(case when predicted_label=0 and actual_label=1 then 1 else 0 end)
+/ sum(case when actual_label=1 then 1 else 0 end) * 100 
+as False_Negative_Rate format=6.2
+from final_dataset_clean
+group by income_group;
+quit;
+
+proc sql;
+select 
+case 
+when confidence_score < 0.5 then 'Low Confidence'
+when confidence_score between 0.5 and 0.8 then 'Medium Confidence'
+else 'High Confidence'
+end as Confidence_Band,
+sum(case when predicted_label=1 and actual_label=0 then 1 else 0 end)
+/ sum(case when actual_label=0 then 1 else 0 end) * 100 
+as False_Positive_Rate format=6.2,
+sum(case when predicted_label=0 and actual_label=1 then 1 else 0 end)
+/ sum(case when actual_label=1 then 1 else 0 end) * 100 
+as False_Negative_Rate format=6.2
+from final_dataset_clean
+group by Confidence_Band;
+quit;
+/* The model does not show extreme demographic bias, as False Positive Rates are consistently around 51–53% across gender, age, region, and income segments. 
+However, the high and uniform error rate suggests the model lacks predictive power. Additionally, high-confidence predictions do not significantly reduce error rates,
+ indicating poor probability calibration. The model requires re-training and threshold optimization before deployment. */
+proc sql;
+select 
+model_version,
+gender,
+income_group,
+region,
+sum(case when predicted_label ne actual_label then 1 else 0 end) 
+as Total_Errors,
+count(*) as Total_Customers,
+calculated Total_Errors / calculated Total_Customers * 100 
+as Error_Rate format=6.2
+from final_dataset_clean
+group by model_version, gender, income_group, region
+order by calculated Error_Rate desc;
+quit;
+/* Male + High Income + East (v3) → ~69% error 
+Male + High Income + West (v3) → ~68% error
+ Female + High Income + South (v1) → ~68% */
+proc sql;
+select 
+gender,income_group,region,
+sum(case when predicted_label=1 and actual_label=0 then 1 else 0 end) 
+as False_Positive_Count
+from final_dataset_clean
+group by gender, income_group, region
+order by False_Positive_Count desc;
+quit;
+
+proc sql;
+select 
+gender,
+income_group,
+region,
+sum(case when predicted_label=0 and actual_label=1 then 1 else 0 end) 
+as False_Negative_Count
+from final_dataset_clean
+group by gender, income_group, region
+order by False_Negative_Count desc;
+quit;
+
+proc sql;
+select 
+case 
+when confidence_score < 0.5 then 'Low Confidence'
+when confidence_score between 0.5 and 0.8 then 'Medium Confidence'
+else 'High Confidence'
+end as Confidence_Band,
+count(*) as Total_Predictions,
+sum(case when predicted_label=actual_label then 1 else 0 end)
+/ count(*) * 100 as Accuracy format=6.2
+from final_dataset_clean
+group by Confidence_Band;
+quit;
+
+proc sql;
+select 
+gender,
+sum(case 
+when confidence_score > 0.8 
+and predicted_label=1 
+and actual_label=0 
+then 1 else 0 end) as HighConf_Risky_Approvals
+from final_dataset_clean
+group by gender
+order by HighConf_Risky_Approvals desc;
+quit;
+/* Error distribution analysis shows that high mistake volumes occur particularly in low-income and demographically unknown segments. Additionally, high-confidence predictions do not improve accuracy, indicating poor calibration. The model demonstrates weak discriminatory power and inconsistent reliability across customer segments. */
